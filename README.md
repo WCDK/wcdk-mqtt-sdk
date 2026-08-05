@@ -373,3 +373,13 @@ SDK 的启动连接在后台执行。首次连接失败会记录警告日志，�
 | `MqttAcknowledgement` | 手动确认消息 |
 | `MqttProperties` | `wcdk.mqtt` 配置映射 |
 | `MqttClientConfiguration` | SDK Spring 配置入口 |
+
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 联系方式
+
+- 作者：WCDK
+- 邮箱：wcdk1024@gmail.com
