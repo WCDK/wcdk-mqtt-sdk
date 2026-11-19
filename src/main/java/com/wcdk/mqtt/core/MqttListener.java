@@ -6,34 +6,33 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
-/**
- * @auther WCDK
- * @date 2026/7/8
- * @version 1.0
- **/
+/***
+* MQTT 监听方法注解：标注在 Spring Bean 方法上，SDK 自动按主题订阅并在重连后恢复订阅。
+* @author wcdk
+***/
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface MqttListener {
 
-    /**
-     * MQTT topic filters to subscribe.
-     *
-     * @return topic filter array
-     */
+    /***
+    * 主题过滤器数组，支持 + 与 # 通配符。
+    * @author wcdk
+    * @return 主题过滤器数组
+    ***/
     String[] topics() default {};
 
-    /**
-     * Alias for {@link #topics()}.
-     *
-     * @return topic filter array
-     */
+    /***
+    * topics() 的别名。
+    * @author wcdk
+    * @return 主题过滤器数组
+    ***/
     String[] value() default {};
 
-    /**
-     * MQTT QoS, valid values are 0, 1 and 2.
-     *
-     * @return qos
-     */
+    /***
+    * 订阅 QoS，取值 0、1、2。
+    * @author wcdk
+    * @return QoS
+    ***/
     int qos() default 1;
 }

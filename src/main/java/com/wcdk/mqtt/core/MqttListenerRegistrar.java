@@ -26,11 +26,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/**
- * @auther WCDK
- * @date 2026/8/4
- * @version 1.0
- **/
+/***
+* @MqttListener 注解方法注册器：扫描 Spring Bean 中的监听方法并登记，
+* 同时作为按注解主题过滤的 MqttMessageListener 参与消息分发与手动 ACK 兜底确认。
+* @author wcdk
+**/
 public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageListener {
 
     private static final Logger log = LoggerFactory.getLogger(MqttListenerRegistrar.class);
@@ -60,12 +60,14 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
         Map<String, MqttProperties.Subscription> subscriptions = new LinkedHashMap<>();
         for (MethodHandler handler : handlers) {
             for (String topic : handler.topics) {
-                MqttProperties.Subscription subscription = subscriptions.computeIfAbsent(topic, key -> {
-                    MqttProperties.Subscription value = new MqttProperties.Subscription();
-                    value.setTopic(key);
-                    return value;
-                });
-                subscription.setQos(Math.max(subscription.getQos(), handler.qos));
+                MqttProperties.Subscription subscription = subscriptions.get(topic);
+                if (subscription == null) {
+                    // 新增主题按监听方法声明的 QoS 订阅，避免被 Subscription 默认值 1 抬高
+                    subscription = new MqttProperties.Subscription(topic, handler.qos);
+                    subscriptions.put(topic, subscription);
+                } else {
+                    subscription.setQos(Math.max(subscription.getQos(), handler.qos));
+                }
             }
         }
         return new ArrayList<>(subscriptions.values());
@@ -98,22 +100,32 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
     private void registerListener(Object bean, String beanName, Method method, MqttListener listener) {
         List<String> topics = resolveTopics(listener);
         if (topics.isEmpty()) {
-            log.error("MQTT listener method {} topic must not be empty", method.getName());
+            log.error("MQTT监听方法主题不能为空，方法：{}", method.getName());
             return;
         }
         if (!validateMethod(method)) {
             return;
         }
         ReflectionUtils.makeAccessible(method);
-        MethodHandler handler = new MethodHandler(bean, method, topics, normalizeQos(listener.qos()));
+        MethodHandler handler = new MethodHandler(bean, method, topics, MqttTopics.normalizeQos(listener.qos()),
+                hasAcknowledgementParameter(method));
         handlers.add(handler);
-        log.info("MQTT listener registered, beanName={}, method={}, topics={}, qos={}",
+        log.info("MQTT监听方法注册成功，Bean名称：{}，方法：{}，主题：{}，QoS：{}",
                 beanName, method.getName(), topics, handler.qos);
+    }
+
+    private static boolean hasAcknowledgementParameter(Method method) {
+        for (Parameter parameter : method.getParameters()) {
+            if (MqttAcknowledgement.class.isAssignableFrom(parameter.getType())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean validateMethod(Method method) {
         if (!void.class.equals(method.getReturnType())) {
-            log.error("MQTT listener method {} return type must be void", method.getName());
+            log.error("MQTT监听方法返回值必须为void，方法：{}", method.getName());
             return false;
         }
         for (Parameter parameter : method.getParameters()) {
@@ -124,7 +136,7 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
                     || MqttAcknowledgement.class.isAssignableFrom(parameterType)) {
                 continue;
             }
-            log.error("MQTT listener method {} has unsupported parameter type {}",
+            log.error("MQTT监听方法存在不支持的参数类型，方法：{}，参数类型：{}",
                     method.getName(), parameterType.getName());
             return false;
         }
@@ -132,9 +144,22 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
     }
 
     private void dispatch(String topic, MqttMessage message, MqttAcknowledgement acknowledgement) throws Exception {
+        boolean ackRequested = false;
+        List<MethodHandler> matched = new ArrayList<>();
         for (MethodHandler handler : handlers) {
             if (handler.matches(topic)) {
+                matched.add(handler);
+                ackRequested = ackRequested || handler.acceptsAcknowledgement;
+            }
+        }
+        try {
+            for (MethodHandler handler : matched) {
                 invokeListenerMethod(handler, topic, message, acknowledgement);
+            }
+        } finally {
+            // 没有注解方法接收 ACK 入参时由 SDK 兜底确认，避免在途窗口被未确认消息占满
+            if (acknowledgement != null && !ackRequested) {
+                acknowledgement.commit();
             }
         }
     }
@@ -144,7 +169,7 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
                                       MqttMessage message,
                                       MqttAcknowledgement acknowledgement) throws Exception {
         try {
-            log.info("MQTT listener received message, topic={}, qos={}, retained={}",
+            log.debug("MQTT监听方法收到消息，主题：{}，QoS：{}，是否保留：{}",
                     topic, message == null ? null : message.getQos(), message != null && message.isRetained());
             handler.method.invoke(handler.bean, resolveArguments(handler.method, topic, message, acknowledgement));
         } catch (InvocationTargetException ex) {
@@ -152,7 +177,7 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
             if (targetException instanceof Exception exception) {
                 throw exception;
             }
-            throw new IllegalStateException("Invoke MQTT listener method failed, method=" + handler.method.getName(), targetException);
+            throw new IllegalStateException("调用MQTT监听方法失败，方法：" + handler.method.getName(), targetException);
         }
     }
 
@@ -210,10 +235,7 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
     }
 
     private int normalizeQos(int qos) {
-        if (qos < 0 || qos > 2) {
-            throw new IllegalArgumentException("MQTT QoS must be 0, 1 or 2");
-        }
-        return qos;
+        return MqttTopics.normalizeQos(qos);
     }
 
     private static final class MethodHandler {
@@ -226,42 +248,24 @@ public class MqttListenerRegistrar implements BeanPostProcessor, MqttMessageList
 
         private final int qos;
 
-        private MethodHandler(Object bean, Method method, List<String> topics, int qos) {
+        private final boolean acceptsAcknowledgement;
+
+        private MethodHandler(Object bean, Method method, List<String> topics, int qos,
+                              boolean acceptsAcknowledgement) {
             this.bean = bean;
             this.method = method;
             this.topics = topics;
             this.qos = qos;
+            this.acceptsAcknowledgement = acceptsAcknowledgement;
         }
 
         private boolean matches(String topic) {
             for (String topicFilter : topics) {
-                if (matchesTopicFilter(topicFilter, topic)) {
+                if (MqttTopics.matches(topicFilter, topic)) {
                     return true;
                 }
             }
             return false;
-        }
-
-        private boolean matchesTopicFilter(String filter, String topic) {
-            if (filter.equals(topic)) {
-                return true;
-            }
-            String[] filterLevels = filter.split("/", -1);
-            String[] topicLevels = topic == null ? new String[0] : topic.split("/", -1);
-            int i = 0;
-            for (; i < filterLevels.length; i++) {
-                String filterLevel = filterLevels[i];
-                if ("#".equals(filterLevel)) {
-                    return i == filterLevels.length - 1;
-                }
-                if (i >= topicLevels.length) {
-                    return false;
-                }
-                if (!"+".equals(filterLevel) && !filterLevel.equals(topicLevels[i])) {
-                    return false;
-                }
-            }
-            return i == topicLevels.length;
         }
     }
 }

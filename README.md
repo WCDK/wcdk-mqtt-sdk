@@ -12,27 +12,22 @@
 
 ```xml
 <dependency>
-    <groupId>org.springframework.boot</groupId>
+    <groupId>com.wcdk.mqtt</groupId>
     <artifactId>wcdk-mqtt-sdk</artifactId>
-    <version>3.5.16</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
-> `groupId` 和 `version` 当前继承自 Spring Boot Parent。如果 SDK 发布时调整了 Maven 坐标，请使用制品仓库中的实际坐标。
-
 ## 2. 启用 SDK
 
-当前版本没有注册 Spring Boot 自动配置文件，业务应用需要显式导入配置类：
+SDK 已注册 Spring Boot 自动配置（`META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`），第三方应用**只需引入依赖**，无需 `@Import`、无需扫描 SDK 包：
 
 ```java
 package com.example.demo;
 
-import com.wcdk.mqtt.config.MqttClientConfiguration;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.context.annotation.Import;
 
-@Import(MqttClientConfiguration.class)
 @SpringBootApplication
 public class DemoApplication {
 
@@ -42,7 +37,7 @@ public class DemoApplication {
 }
 ```
 
-也可以把 `@Import(MqttClientConfiguration.class)` 放在任意 Spring `@Configuration` 类上。
+自动装配会创建 `MqttConnectOptions`、`MqttAsyncClient`、监听线程池、`MqttListenerRegistrar`、`MqttClientManager` 与 `MqttUtil`，每个 Bean 均可用自定义 Bean 覆盖（`@ConditionalOnMissingBean`）。旧版本的 `@Import(MqttClientConfiguration.class)` 显式启用方式继续有效。设置 `wcdk.mqtt.enabled=false` 可关闭全部 Bean。
 
 ## 3. 配置连接
 
@@ -79,11 +74,28 @@ wcdk:
 
     clean-session: true
     automatic-reconnect: true
+    # Paho 自动重连指数退避上限
+    max-reconnect-delay: 128s
+    # 首次连接失败后的重试间隔，0 表示不重试
+    connect-retry-interval: 10s
+    # MQTT 协议版本：0=自动协商，3=MQTT 3.1，4=MQTT 3.1.1
+    mqtt-version: 0
     manual-ack: false
     connection-timeout: 30s
     keep-alive-interval: 60s
     completion-timeout: 10s
     max-inflight: 1000
+
+    # 遗嘱消息：客户端异常掉线（无 DISCONNECT）时由 Broker 发布
+    will-topic: device/1/lwt
+    will-payload: offline
+    will-qos: 1
+    will-retained: false
+
+    # 未连接时缓存待发送消息
+    disconnected-buffer-enabled: false
+    disconnected-buffer-size: 10000
+    disconnected-buffer-delete-oldest: false
 
     # publish() 是否异步发送
     async-publish: true
@@ -115,11 +127,21 @@ wcdk:
 | `username` / `password` | 空 | Broker 认证信息 |
 | `clean-session` | `true` | 是否使用清洁会话 |
 | `automatic-reconnect` | `true` | 断线后是否由 Paho 自动重连 |
+| `max-reconnect-delay` | `128s` | Paho 自动重连指数退避的最大间隔 |
+| `connect-retry-interval` | `10s` | 首次连接失败后的后台重试间隔；`0` 或负数表示不重试 |
+| `mqtt-version` | `0` | MQTT 协议版本：`0`=自动协商，`3`=3.1，`4`=3.1.1 |
 | `manual-ack` | `false` | 是否手动确认收到的消息 |
 | `connection-timeout` | `30s` | 连接超时 |
 | `keep-alive-interval` | `60s` | 心跳间隔 |
 | `completion-timeout` | `10s` | 同步发布、订阅、取消订阅等操作的等待超时 |
 | `max-inflight` | `1000` | 同时处于发送中的最大消息数，最小为 1 |
+| `will-topic` | 空 | 遗嘱主题，配置后客户端异常掉线时由 Broker 发布遗嘱消息 |
+| `will-payload` | 空 | 遗嘱消息正文（UTF-8） |
+| `will-qos` | `1` | 遗嘱 QoS |
+| `will-retained` | `false` | 遗嘱是否为保留消息 |
+| `disconnected-buffer-enabled` | `false` | 未连接时是否缓存待发送消息 |
+| `disconnected-buffer-size` | `10000` | 缓存队列容量，最小为 1 |
+| `disconnected-buffer-delete-oldest` | `false` | 缓存队列满时是否删除最早的消息 |
 | `async-publish` | `true` | `publish` 默认异步还是同步等待 |
 | `default-qos` | `1` | `MqttUtil` 简化方法使用的默认 QoS |
 | `default-retained` | `false` | `MqttUtil` 简化方法使用的默认 retained 标志 |
@@ -246,6 +268,18 @@ public class PaymentListener {
 }
 ```
 
+### 手动 ACK 确认规则（重要）
+
+同一条消息只生成**一个** `MqttAcknowledgement`，多个监听器共享，任一 `commit()` 即完成确认（`commit()` 幂等，重复调用只确认一次）。确认时机按以下规则兜底，避免在途窗口被未确认消息占满：
+
+| 场景 | 行为 |
+| --- | --- |
+| 注解方法声明了 `MqttAcknowledgement` 参数 | 由该方法自行决定确认时机，SDK 不兜底 |
+| 注解方法均未声明该参数 | 方法执行结束（含异常）后由 SDK 自动 `commit()` |
+| 接口监听器覆盖了三参 `onMessage` | 由实现自行决定确认时机 |
+| 接口监听器只实现两参 `onMessage` | 默认实现委托两参方法，并在 `finally` 中自动 `commit()` |
+| 消息未被任何监听器匹配 | 分发前立即自动确认 |
+
 不开启手动 ACK 时，注解参数中的 `MqttAcknowledgement` 为 `null`，因此不要在自动 ACK 模式下调用它。
 
 ## 7. 实现接口接收消息
@@ -294,7 +328,7 @@ public void onMessage(String topic,
 }
 ```
 
-> 接口监听器的 `subscriptions()` 用于创建订阅，但当前实现会把客户端收到的每条消息分发给每个 `MqttMessageListener` Bean。如注册了多个接口监听器，请在 `onMessage` 中自行判断 `topic`；需要自动按主题过滤时，优先使用 `@MqttListener`。
+> `subscriptions()` 非空时，SDK 会按声明的主题过滤器（支持 `+` / `#`）**只把命中的消息分发给该监听器**；返回空列表表示不产生自动订阅，同时接收客户端收到的全部消息。多个接口监听器互不干扰，无需自行判断 `topic`。
 
 ## 8. 动态订阅与连接状态
 
@@ -330,23 +364,42 @@ public class DynamicSubscriptionService {
 - `subscribe` 会在未连接时先尝试连接。
 - `unsubscribe` 在未连接时直接返回。
 - 通过配置、注解或监听器声明的主题会在重连后自动订阅。
-- 仅通过 `mqttUtil.subscribe(...)` 创建的动态订阅不会被 SDK 记录，断线重连后需要业务代码重新订阅。
+- 通过 `mqttUtil.subscribe(...)` 创建的**动态订阅会被 SDK 登记持久化**，断线重连后自动重新订阅；`unsubscribe` 会取消登记。
+
+### 连接状态回调
+
+注册 `MqttConnectionListener` Bean 即可被 SDK 自动收集，也可通过 `MqttUtil.addConnectionListener(...)` 编程式注册：
+
+```java
+import com.wcdk.mqtt.listener.MqttConnectionListener;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ConnectionStateLogger implements MqttConnectionListener {
+
+    @Override
+    public void onConnected(boolean reconnect) {
+        // reconnect=true 表示断线后的自动重连
+    }
+
+    @Override
+    public void onDisconnected(Throwable cause) {
+        // 主动正常断开时 cause 可能为 null
+    }
+}
+```
+
+回调在 SDK 内部线程执行，不要长时间阻塞。连接成功后可通过 `mqttUtil.getServerUri()` 获取实际连接成功的 Broker 地址（多地址故障转移后为命中的地址）。
 
 ## 9. 常见问题
 
 ### 注入不到 `MqttUtil`
 
-确认应用已经添加：
-
-```java
-@Import(MqttClientConfiguration.class)
-```
-
-同时确认 `wcdk.mqtt.enabled` 没有设为 `false`。
+确认应用已添加 `wcdk-mqtt-sdk` 依赖且 `wcdk.mqtt.enabled` 没有设为 `false`。SDK 走 Spring Boot 自动配置，无需 `@Import`；若曾显式导入 `MqttClientConfiguration` 也可以继续保留。
 
 ### 应用启动时 Broker 不可用
 
-SDK 的启动连接在后台执行。首次连接失败会记录警告日志，不会阻止 Spring Boot 应用启动。后续发布或订阅操作会再次尝试连接。
+SDK 的启动连接在后台执行。首次连接失败会记录警告日志，不会阻止 Spring Boot 应用启动，之后按 `connect-retry-interval` 反复重试；连接成功后自动补齐配置订阅、监听器订阅与动态订阅。`automatic-reconnect: true` 时断线由 Paho 自动重连。
 
 ### 收不到注解消息
 
@@ -366,13 +419,14 @@ SDK 的启动连接在后台执行。首次连接失败会记录警告日志，�
 
 | 类 | 用途 |
 | --- | --- |
-| `MqttUtil` | 常用发布、订阅、取消订阅和连接状态查询 |
+| `MqttUtil` | 常用发布、订阅、取消订阅、连接状态与连接回调 |
 | `MqttClientManager` | 底层连接生命周期及完整发布/订阅能力 |
 | `@MqttListener` | 声明式主题监听 |
-| `MqttMessageListener` | 编程式消息监听接口 |
+| `MqttMessageListener` | 编程式消息监听接口（按 `subscriptions()` 过滤） |
+| `MqttConnectionListener` | 连接建立/断开状态回调 |
 | `MqttAcknowledgement` | 手动确认消息 |
 | `MqttProperties` | `wcdk.mqtt` 配置映射 |
-| `MqttClientConfiguration` | SDK Spring 配置入口 |
+| `MqttClientConfiguration` | SDK 自动装配入口（无需显式导入） |
 
 
 ## 贡献
